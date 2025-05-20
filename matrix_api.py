@@ -5,6 +5,7 @@ import pathlib
 import logging
 import time
 import flask
+from flask_cors import CORS
 import requests
 import json
 
@@ -18,7 +19,6 @@ class Db:
         self.RROLES = { name: id for id, name in self.ROLES.items() }
         self.setup_db()
         self.last_ingest = 0.0
-        self.conn = self.connect()
 
     def connect(self):
         return sqlite3.connect(self.dbpath, check_same_thread=False, autocommit=False)
@@ -76,6 +76,8 @@ class Db:
     def __create_line(self, dir:str, name: str, desc: str, ports: dict):
         logging.debug(f'Create {dir}, "{name}", "{desc}", ports: {ports}')
         with self.connect() as c:
+            if type(ports) is not dict or any([role not in self.RROLES or type(port) is not int for role, port in ports.items()]):
+                raise KeyError(f'Ports present but incorrectly formatted')
             r = c.execute(f"INSERT INTO {dir} (name, description) VALUES (?, ?)", (name, desc))
             lineid = r.lastrowid
             data = [(lineid, self.RROLES[role], port) for role, port in ports.items()]
@@ -90,6 +92,8 @@ class Db:
 
     def __update_line(self, dir:str, id:int, name: str, desc: str, ports: dict):
         with self.connect() as c:
+            if ports is not None and any([role not in self.RROLES or type(port) is not int for role, port in ports.items()]):
+                raise KeyError(f'Ports present but incorrectly formatted')
             if name is None and desc is None:
                 r = c.execute(f"SELECT COUNT(*) FROM {dir} WHERE {dir}.{dir} = ?", (id,))
                 if r.fetchone[0] == 0:
@@ -99,7 +103,7 @@ class Db:
             if desc is not None:
                 c.execute(f"UPDATE {dir} SET description = ? WHERE {dir}.{dir} = ?", (desc, id))
             if ports is not None:
-                data = [(id, role, self.RROLES[port]) for role, port in ports.items()]
+                data = [(id, self.RROLES[role], port) for role, port in ports.items()]
                 c.execute(f"DELETE FROM {dir}map WHERE {dir} = ?", (id,))
                 c.executemany(f"INSERT INTO {dir}map ({dir}, role, {dir}port) VALUES (?, ?, ?)", data)
 
@@ -124,17 +128,17 @@ class Db:
         with self.connect() as c:
             idfilt = f"WHERE {dir}.{dir} = {id} " if type(id) is int else ""
             lines = []
-            r = c.execute(f"SELECT {dir}.{dir}, {dir}.name, {dir}.description, role, pname "+
+            r = c.execute(f"SELECT {dir}.{dir}, {dir}.name, {dir}.description, role, pid, pname "+
                     f"FROM {dir} LEFT OUTER JOIN "+
-                    f"(SELECT {dir}map.{dir} as lid, role, name as pname FROM {dir}map, {dir}port WHERE {dir}map.{dir}port = {dir}port.{dir}port) "+
+                    f"(SELECT {dir}map.{dir} as lid, role, {dir}port.{dir}port as pid, name as pname FROM {dir}map, {dir}port WHERE {dir}map.{dir}port = {dir}port.{dir}port) "+
                     f"ON lid = {dir}.{dir} {idfilt}" +
                     f"ORDER BY {dir}.{dir}, role")
 
-            for id, name, desc, role, port in r:
+            for id, name, desc, role, pid, port in r:
                 if not lines or id != lines[-1]['id']:
                     lines.append({'id': id,'name': name, 'description': desc, 'ports': {}})
                 if port is not None:
-                    lines[-1]['ports'][self.ROLES[role]] = port
+                    lines[-1]['ports'][self.ROLES[role]] = [pid, port]
 
             return lines
 
@@ -348,6 +352,36 @@ def api(app, db, pw):
     def get_active_links():
         return pw.get_links()
 
+    def err_resp(e):
+        return {
+            'type': type(e).__name__,
+            'msg': str(e),
+            'url': flask.request.url,
+            'method': flask.request.method,
+            'data': flask.request.data.decode()
+        }
+
+    @app.errorhandler(KeyError)
+    def handle_exception(err):
+        """Generic handler for KeyError as it's probably their fault"""
+        response = err_resp(err)
+        logging.exception(f'Data error processing request: {response}')
+        return response, 400
+
+    @app.errorhandler(ValueError)
+    def handle_exception(err):
+        """Generic handler for ValueError as it's probably their fault"""
+        response = err_resp(err)
+        logging.exception(f'Data error processing request: {response}')
+        return response, 400
+
+    @app.errorhandler(IndexError)
+    def handle_exception(err):
+        """Generic handler for IndexError as it's probably their fault"""
+        response = err_resp(err)
+        logging.exception(f'Data error processing request: {response}')
+        return response, 400
+
 
 def test_populate(db, pw):
     try:
@@ -376,11 +410,14 @@ if __name__ == '__main__':
     logging.debug(f"Let's Goooo")
     db = Db()
     app = flask.Flask(__name__)
+    CORS(app)
     pw = PW()
     api(app, db, pw)
 
-    mtx = test_populate(db, pw)
-    print(db.get_matrix_lines(mtx))
+    # mtx = test_populate(db, pw)
+    # print(db.get_matrix_lines(mtx))
+    update_db_from_pw(db, pw)
+    update_pw_from_db(db, pw)
     print(db.get_port_patches())
 
     app.run(host='0.0.0.0', debug=True)
