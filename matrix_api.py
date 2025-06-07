@@ -21,28 +21,29 @@ class Db:
         self.last_ingest = 0.0
 
     def connect(self):
-        return sqlite3.connect(self.dbpath, check_same_thread=False, autocommit=False)
+        conn = sqlite3.connect(self.dbpath, check_same_thread=False, autocommit=False)
+        # WTF https://github.com/python/cpython/issues/120530 Enable foreign key constraint enforcement for every damn connection with hackyness
+        conn.executescript('COMMIT;PRAGMA foreign_keys = ON;BEGIN')
+        return conn
 
     def setup_db(self):
         with self.connect() as c:
             c.execute("CREATE TABLE IF NOT EXISTS dst(dst INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS src(src INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT)")
-            c.execute("CREATE TABLE IF NOT EXISTS patch(src INTEGER REFERENCES src(src), dst INTEGER REFERENCES dst(dst), UNIQUE (dst) )")
+            c.execute("CREATE TABLE IF NOT EXISTS patch(src INTEGER REFERENCES src(src) ON DELETE CASCADE, dst INTEGER REFERENCES dst(dst) ON DELETE CASCADE, UNIQUE (dst) )")
             c.execute("CREATE TABLE IF NOT EXISTS matrix(matrix INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, mode INTEGER)")
 
-            c.execute("CREATE TABLE IF NOT EXISTS matrixsrc(matrix INTEGER REFERENCES matrix(matrix), src INTEGER REFERENCES src(src), position INTEGER, UNIQUE (matrix, src) )")
-            c.execute("CREATE TABLE IF NOT EXISTS matrixdst(matrix INTEGER REFERENCES matrix(matrix), dst INTEGER REFERENCES dst(dst), position INTEGER, UNIQUE (matrix, dst) )")
+            c.execute("CREATE TABLE IF NOT EXISTS matrixsrc(matrix INTEGER REFERENCES matrix(matrix) ON DELETE CASCADE, src INTEGER REFERENCES src(src) ON DELETE CASCADE, position INTEGER, UNIQUE (matrix, src) )")
+            c.execute("CREATE TABLE IF NOT EXISTS matrixdst(matrix INTEGER REFERENCES matrix(matrix) ON DELETE CASCADE, dst INTEGER REFERENCES dst(dst) ON DELETE CASCADE, position INTEGER, UNIQUE (matrix, dst) )")
 
-            c.execute("CREATE TABLE IF NOT EXISTS dstmap(dst INTEGER REFERENCES dst(dst), role INTEGER NOT NULL, dstport INTEGER REFERENCES dstport(dstport), UNIQUE (dst, dstport, role))")
-            c.execute("CREATE TABLE IF NOT EXISTS srcmap(src INTEGER REFERENCES src(src), role INTEGER NOT NULL, srcport INTEGER REFERENCES dstport(dstport), UNIQUE (src, srcport, role))")
+            c.execute("CREATE TABLE IF NOT EXISTS dstmap(dst INTEGER REFERENCES dst(dst) ON DELETE CASCADE, role INTEGER NOT NULL, dstport INTEGER UNIQUE REFERENCES dstport(dstport) ON DELETE CASCADE, UNIQUE (dst, role))")
+            c.execute("CREATE TABLE IF NOT EXISTS srcmap(src INTEGER REFERENCES src(src) ON DELETE CASCADE, role INTEGER NOT NULL, srcport INTEGER UNIQUE REFERENCES srcport(srcport) ON DELETE CASCADE, UNIQUE (src, role))")
 
             c.execute("CREATE TABLE IF NOT EXISTS dstport(dstport INTEGER PRIMARY KEY, name TEXT UNIQUE, lastseen REAL)")
             c.execute("CREATE TABLE IF NOT EXISTS srcport(srcport INTEGER PRIMARY KEY, name TEXT UNIQUE, lastseen REAL)")
 
-            c.execute("CREATE TABLE IF NOT EXISTS link(srcport INTEGER, dstport INTEGER, UNIQUE (srcport, dstport) )")
+            c.execute("CREATE TABLE IF NOT EXISTS link(srcport INTEGER REFERENCES srcport(srcport), dstport INTEGER REFERENCES dstport(dstport), UNIQUE (srcport, dstport) )")
     
-            c.execute("PRAGMA foreign_keys = ON")
-
     def get_matrix_lines(self, id: int):
         with self.connect() as c:
             srcs = []
@@ -72,6 +73,32 @@ class Db:
                     "ORDER BY src.src, dst.dst, srcmap.role",
                     (id, id))
             return r_desired.fetchall()
+
+
+    def get_matrix_patch_state(self, id: int):
+        result = {}
+        for src, dst, role in self.get_matrix_desired(id):
+            if dst not in result:
+                result[dst]['desired'] = { 'src': src }
+            
+            result[dst]['desired'][self.ROLES[role]] = False
+        
+        for src, dst, srcrole, dstrole in self.get_matrix_active(id):
+            desired = result.get(dst, {}).get('desired',{'src':None})
+            if desired['src'] == src and self.ROLES[dstrole] in desired and dstrole == srcrole:
+                desired[self.ROLES[dstrole]] = True
+                continue
+
+            if dst not in result:
+                result[dst] = {'others': []}
+            m = [ other for other in result[dst]['others'] if other[src] == src ]
+            if m:
+                m[0][self.ROLES[dstrole]] = self.ROLES[src.srcrole]
+            else:
+                result[dst]['others'].append({'src':src, self.ROLES[dstrole]: self.ROLES[srcrole]})
+
+        return result
+
 
     def __create_line(self, dir:str, name: str, desc: str, ports: dict):
         logging.debug(f'Create {dir}, "{name}", "{desc}", ports: {ports}')
@@ -115,7 +142,7 @@ class Db:
 
     def __del_line(self, dir, id):
         with self.connect() as c:
-#            c.execute(f"DELETE FROM {dir}map WHERE {dir} = ?", (id,))
+            # c.execute(f"DELETE FROM {dir}map WHERE {dir} = ?", (id,))
             c.execute(f"DELETE FROM {dir} WHERE {dir}.{dir} = ?", (id,))
 
     def del_src(self, id):
@@ -180,6 +207,50 @@ class Db:
             r = c.execute("SELECT srcport.name, dstport.name FROM srcmap, dstmap, srcport, dstport, patch " +
                     "WHERE srcmap.src == patch.src AND dstmap.dst == patch.dst AND srcmap.role == dstmap.role AND srcmap.srcport == srcport.srcport AND dstmap.dstport == dstport.dstport")
             return r.fetchall()
+
+    def update_matrix(self, matrix_id: int, name: str | None, desc: str | None, mode: int | None, new_srcs: list[int] | None, new_dsts: list[int] | None):
+        logging.debug(f"Updating matrix {matrix_id}. Name: {name}, Desc: {desc}, Mode: {mode}, Srcs: {new_srcs}, Dsts: {new_dsts}")
+        with self.connect() as c:
+            if name is not None:
+                c.execute("UPDATE matrix SET name = ? WHERE matrix = ?", (name, matrix_id))
+            if desc is not None:
+                c.execute("UPDATE matrix SET description = ? WHERE matrix = ?", (desc, matrix_id))
+            if mode is not None:
+                c.execute("UPDATE matrix SET mode = ? WHERE matrix = ?", (mode, matrix_id))
+
+            if new_srcs is not None: # If None, don't touch matrixsrc. If [], clear them.
+                logging.debug(f"Updating sources for matrix {matrix_id}. New sources: {new_srcs}")
+                c.execute("DELETE FROM matrixsrc WHERE matrix = ?", (matrix_id,))
+                if new_srcs:
+                    src_data = [(matrix_id, src_id, pos) for pos, src_id in enumerate(new_srcs)]
+                    c.executemany("INSERT INTO matrixsrc (matrix, src, position) VALUES (?, ?, ?)", src_data)
+
+            if new_dsts is not None: # If None, don't touch matrixdst. If [], clear them.
+                logging.debug(f"Updating destinations for matrix {matrix_id}. New destinations: {new_dsts}")
+                c.execute("DELETE FROM matrixdst WHERE matrix = ?", (matrix_id,))
+                if new_dsts:
+                    dst_data = [(matrix_id, dst_id, pos) for pos, dst_id in enumerate(new_dsts)]
+                    c.executemany("INSERT INTO matrixdst (matrix, dst, position) VALUES (?, ?, ?)", dst_data)
+            
+            logging.info(f"Matrix {matrix_id} updated successfully.")
+
+    def del_matrix(self, matrix_id: int):
+        logging.debug(f"Deleting matrix {matrix_id}")
+        with self.connect() as c:
+            try:
+                # Delete parent should cascade to matrixsrc/dst tables
+                cursor = c.execute("DELETE FROM matrix WHERE matrix = ?", (matrix_id,))
+                
+                if cursor.rowcount == 0:
+                    logging.warning(f"Attempted to delete matrix {matrix_id}, but it was not found.")
+                    # raise KeyError(f"Matrix with id {matrix_id} not found for deletion.") # Optional: be strict
+                
+                c.commit()
+                logging.info(f"Matrix {matrix_id} deleted successfully.")
+                return cursor.rowcount > 0 # Return True if a row was deleted
+            except sqlite3.Error as e:
+                logging.error(f"Database error deleting matrix {matrix_id}: {e}")
+                raise
 
     def patch(self, src: int, dst: int):
         with self.connect() as c:
@@ -253,14 +324,73 @@ def api(app, db, pw):
     def get_matrix(id):
         update_db_from_pw(db, pw)
         srcs, dsts = db.get_matrix_lines(id)
-        active = db.get_matrix_active(id)
-        desired = db.get_matrix_desired(id)
+        patch_state = db.get_matrix_patch_state
+        for dst in dsts:
+            ps = patch_state.get(dst['id'], None)
+            if ps is not None:
+                dst.update(ps)
+                if 'desired' in ps:
+                    if 'other' in ps:
+                        dst['state'] = 'overpatched'
+                    elif all(ps['desired'].values()):
+                        dst['state'] = 'patched'
+                    elif any(ps['desired'].values()):
+                        dst['state'] = 'partial'
+                    else:
+                        dst['state'] = 'inactive'
+                elif 'other' in ps:
+                        dst['state'] = 'overpatched'
+                else:
+                        dst['state'] = 'unpatched'
+
         return {
             'srcs': srcs,
             'dsts': dsts,
-            'active': active,
-            'desired': desired
         }, 200 if srcs or dsts else 404
+
+    @app.route('/matrix', methods=['POST'])
+    def create_matrix_endpoint():
+        data = flask.request.get_json()
+        if not data or 'name' not in data or 'srcs' not in data or 'dsts' not in data:
+            return flask.jsonify({"error": "Missing required fields: name, srcs, dsts"}), 400
+        
+        name = data['name']
+        desc = data.get('description', '')
+        mode = data.get('mode', 0) # Default mode to 0 if not provided
+        srcs_ids = data.get('srcs', []) # List of source IDs in order
+        dsts_ids = data.get('dsts', []) # List of destination IDs in order
+
+        if not isinstance(name, str) or not isinstance(desc, str) or \
+           not isinstance(mode, int) or not isinstance(srcs_ids, list) or \
+           not isinstance(dsts_ids, list):
+            return flask.jsonify({"error": "Invalid data types for one or more fields."}), 400
+        
+        matrix_id = db.create_matrix(name, desc, mode, srcs_ids, dsts_ids)
+        return {"id": matrix_id, "name": name, "description": desc, "mode": mode}, 201
+
+    @app.route('/matrix/<int:id>', methods=['PUT'])
+    def update_matrix_endpoint(id):
+        data = flask.request.get_json()
+        if not data:
+            return flask.jsonify({"error": "Request body must be JSON."}), 400
+
+        db.update_matrix(
+            matrix_id=id,
+            name=data.get('name'), # Pass None if key is missing, db method handles it
+            desc=data.get('description'),
+            mode=data.get('mode'),
+            new_srcs=data.get('srcs'), # Pass list of IDs or None
+            new_dsts=data.get('dsts')  # Pass list of IDs or None
+        )
+        return '"ok"\n'
+
+    @app.route('/matrix/<int:id>', methods=['DELETE'])
+    def del_matrix_endpoint(id):
+        deleted = db.del_matrix(id)
+        if deleted:
+            return {"message": f"Matrix {id} deleted successfully."}, 200 # Or 204 No Content
+        else:
+            return {"error": f"Matrix {id} not found."}, 404
 
     @app.route('/src', methods=['GET'])
     def get_srcs():
@@ -274,14 +404,17 @@ def api(app, db, pw):
     def update_src(id):
         data = flask.request.get_json()
         db.update_src(id, data.get('name', None), data.get('description', None), data.get('ports', None))
+        if 'ports' in data:
+            update_pw_from_db(db, pw)
         return '"ok"\n'
 
     @app.route('/src/<int:id>', methods=['DELETE'])
     def del_src(id):
         db.del_src(id)
+        update_pw_from_db(db, pw)
         return '"ok"\n'
 
-    @app.route('/src', methods=['PUT'])
+    @app.route('/src', methods=['PUT','POST'])
     def create_src():
         data = flask.request.get_json()
         return { 'id': db.create_src(data['name'], data.get('description', ''), data.get('ports', {})) }
@@ -298,14 +431,17 @@ def api(app, db, pw):
     def update_dst(id):
         data = flask.request.get_json()
         db.update_dst(id, data.get('name', None), data.get('description', None), data.get('ports', None))
+        if 'ports' in data:
+            update_pw_from_db(db, pw)
         return '"ok"\n'
 
     @app.route('/dst/<int:id>', methods=['DELETE'])
     def del_dst(id):
         db.del_dst(id)
+        update_pw_from_db(db, pw)
         return '"ok"\n'
 
-    @app.route('/dst', methods=['PUT'])
+    @app.route('/dst', methods=['PUT', 'POST'])
     def create_dst():
         data = flask.request.get_json()
         return { 'id': db.create_dst(data['name'], data.get('description', ''), data.get('ports', {})) }
@@ -381,6 +517,32 @@ def api(app, db, pw):
         response = err_resp(err)
         logging.exception(f'Data error processing request: {response}')
         return response, 400
+
+    @app.errorhandler(sqlite3.IntegrityError)
+    def handle_exception(err):
+        """SQL integrity error, more than likely due to non-existant port inidices"""
+        response = err_resp(err)
+        logging.exception(f'Data error processing request: {response}')
+        return response, 400
+
+    @app.errorhandler(sqlite3.Error)
+    def handle_exception(err):
+        """Unexpected SQL error"""
+        response = err_resp(err)
+        logging.exception(f'Unexpected Database error: {response}')
+        return response, 500
+
+    # A generic fallback for other unhandled exceptions
+    @app.errorhandler(Exception)
+    def handle_generic_exception(err):
+        from werkzeug.exceptions import HTTPException
+        if isinstance(err, HTTPException): # Don't interfere with Flask's own HTTP exceptions
+            return err
+        
+        response = err_resp(err)
+        logging.exception(f'Unhandled Exception: {response}')
+        return flask.jsonify(response), 500
+
 
 
 def test_populate(db, pw):
