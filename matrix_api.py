@@ -12,6 +12,8 @@ import json
 
 class Db:
     ROLES = { 1: "left", 2: "right" }
+    METER_NODE = "rest_meter"
+    METER_FMT = METER_NODE+":{:03}-{}" # (Stereo Channel, Role)
     def __init__(self):
         self.dbpath = pathlib.Path(__file__).parent.joinpath("matrix.sqlite")
         logging.info(f'Opening database at {self.dbpath} with threadsafety {sqlite3.threadsafety}')
@@ -43,9 +45,14 @@ class Db:
             c.execute("CREATE TABLE IF NOT EXISTS srcport(srcport INTEGER PRIMARY KEY, name TEXT UNIQUE, lastseen REAL)")
 
             c.execute("CREATE TABLE IF NOT EXISTS link(srcport INTEGER REFERENCES srcport(srcport), dstport INTEGER REFERENCES dstport(dstport), UNIQUE (srcport, dstport) )")
+
+            c.execute("CREATE TABLE IF NOT EXISTS meter(meter INTEGER PRIMARY KEY, src INTEGER UNIQUE REFERENCES src(src) ON DELETE CASCADE, lastused REAL)")
     
     def get_matrix_lines(self, id: int):
         with self.connect() as c:
+            r = c.execute("SELECT name, description, mode from matrix WHERE matrix = ?", (id,))
+            info=r.fetchone()
+
             srcs = []
             dsts = []
             for dir, lines in (('src', srcs), ('dst',dsts)):
@@ -53,7 +60,7 @@ class Db:
                         f"WHERE matrix{dir}.matrix == ? AND {dir}.{dir} == matrix{dir}.{dir} ORDER BY matrix{dir}.position", (id,))
                 lines.extend([ {'id': id, 'name': name } for id, name in r])
 
-            return srcs, dsts
+            return {'name': info[0], 'description': info[1], 'mode': info[2]}, srcs, dsts
 
     def get_matrix_active(self, id: int):
         with self.connect() as c:
@@ -77,13 +84,17 @@ class Db:
 
     def get_matrix_patch_state(self, id: int):
         result = {}
-        for src, dst, role in self.get_matrix_desired(id):
+        mtx_desired = self.get_matrix_desired(id)
+        logging.debug(f"Desired: {mtx_desired}")
+        for src, dst, role in mtx_desired:
             if dst not in result:
-                result[dst]['desired'] = { 'src': src }
+                result[dst] = {'desired': { 'src': src }}
             
             result[dst]['desired'][self.ROLES[role]] = False
-        
-        for src, dst, srcrole, dstrole in self.get_matrix_active(id):
+
+        mtx_active = self.get_matrix_active(id)
+        logging.debug(f"Active: {mtx_active}")
+        for src, dst, srcrole, dstrole in mtx_active:
             desired = result.get(dst, {}).get('desired',{'src':None})
             if desired['src'] == src and self.ROLES[dstrole] in desired and dstrole == srcrole:
                 desired[self.ROLES[dstrole]] = True
@@ -91,14 +102,28 @@ class Db:
 
             if dst not in result:
                 result[dst] = {'others': []}
-            m = [ other for other in result[dst]['others'] if other[src] == src ]
+            elif 'others' not in result[dst]:
+                result[dst]['others'] = []
+            m = [ other for other in result[dst]['others'] if other['src'] == src ]
             if m:
-                m[0][self.ROLES[dstrole]] = self.ROLES[src.srcrole]
+                m[0][self.ROLES[dstrole]] = self.ROLES[srcrole]
             else:
                 result[dst]['others'].append({'src':src, self.ROLES[dstrole]: self.ROLES[srcrole]})
 
+        logging.debug(f"Patch state: {result}")
         return result
 
+    def get_matrix_meters(self, id: int):
+        now = time.time()
+        srcselect = (f'SELECT srcmap.src AS s, ? FROM matrixdst, dstmap, srcmap, link ' +
+                    'WHERE matrixdst.matrix == ? AND matrixdst.dst == dstmap.dst ' +
+                    'AND dstmap.dstport == link.dstport AND srcmap.srcport == link.srcport '+
+                    'UNION SELECT src AS s, ? FROM matrixsrc WHERE matrixsrc.matrix == ?')
+        with self.connect() as c:
+            c.execute(f'INSERT INTO meter (src, lastused) {srcselect} ON CONFLICT DO UPDATE SET lastused = ?', (now, id, now, id, now))
+            r = c.execute(f'SELECT s, meter from ({srcselect}) left outer join meter on meter.src == s', (now, id, now, id))
+
+            return r.fetchall()
 
     def __create_line(self, dir:str, name: str, desc: str, ports: dict):
         logging.debug(f'Create {dir}, "{name}", "{desc}", ports: {ports}')
@@ -204,9 +229,10 @@ class Db:
 
     def get_port_patches(self):
         with self.connect() as c:
-            r = c.execute("SELECT srcport.name, dstport.name FROM srcmap, dstmap, srcport, dstport, patch " +
+            r_patch = c.execute("SELECT srcport.name, dstport.name FROM srcmap, dstmap, srcport, dstport, patch " +
                     "WHERE srcmap.src == patch.src AND dstmap.dst == patch.dst AND srcmap.role == dstmap.role AND srcmap.srcport == srcport.srcport AND dstmap.dstport == dstport.dstport")
-            return r.fetchall()
+            r_meter = c.execute("SELECT srcport.name, meter.meter, srcmap.role FROM meter, srcmap, srcport WHERE meter.src == srcmap.src AND srcmap.srcport == srcport.srcport and (srcmap.role == 1 OR srcmap.role == 2)")
+            return r_patch.fetchall() + [ [portname, self.METER_FMT.format(meter, self.ROLES[role])] for portname, meter, role in r_meter.fetchall() ]
 
     def update_matrix(self, matrix_id: int, name: str | None, desc: str | None, mode: int | None, new_srcs: list[int] | None, new_dsts: list[int] | None):
         logging.debug(f"Updating matrix {matrix_id}. Name: {name}, Desc: {desc}, Mode: {mode}, Srcs: {new_srcs}, Dsts: {new_dsts}")
@@ -269,9 +295,12 @@ class Db:
         with self.connect() as c:
             now = time.time()
             for dir, ports in (('src', srcs), ('dst', dsts)):
-                c.executemany(f"INSERT INTO {dir}port (name, lastseen) VALUES (?, ?) ON CONFLICT DO UPDATE SET lastseen=? ", ( (port, now, now) for port in ports ) )
+                c.executemany(f"INSERT INTO {dir}port (name, lastseen) VALUES (?, ?) ON CONFLICT DO UPDATE SET lastseen=? ", ( (port, now, now) for port in ports if port[:len(self.METER_NODE)] != self.METER_NODE) )
             c.execute(f"DELETE FROM link")
-            c.executemany(f"INSERT INTO link (srcport, dstport) SELECT srcport.srcport, dstport.dstport FROM srcport, dstport WHERE srcport.name == ? AND dstport.name == ?", links)
+            c.executemany(f"INSERT INTO link (srcport, dstport) SELECT srcport.srcport, dstport.dstport FROM srcport, dstport WHERE srcport.name == ? AND dstport.name == ? ON CONFLICT DO NOTHING", links)
+            inscount = c.execute(f"SELECT COUNT(*) FROM link").fetchone()[0]
+            if inscount != len(links):
+                logging.warning(f"Ingesting links, only { inscount }, inserts, but { len(links) } links! Is there a duplicate?")
             self.last_ingest = now
 
 
@@ -315,38 +344,51 @@ def update_pw_from_db(db, pw):
     return pw.set_desired(desired)
 
 def api(app, db, pw):
+    METER_BASE_URL = '/levels/map?'
+
     @app.route('/matrix', methods=['GET'])
     def get_matrices():
         matrices = db.get_matrices()
-        return [ { 'id': id, 'name': name, 'desc': desc, 'mode': mode } for id, name, desc, mode in matrices ]
+        return [ { 'id': id, 'name': name, 'description': desc, 'mode': mode } for id, name, desc, mode in matrices ]
 
     @app.route('/matrix/<int:id>', methods=['GET'])
     def get_matrix(id):
         update_db_from_pw(db, pw)
-        srcs, dsts = db.get_matrix_lines(id)
-        patch_state = db.get_matrix_patch_state
+        info, srcs, dsts = db.get_matrix_lines(id)
+        patch_state = db.get_matrix_patch_state(id)
         for dst in dsts:
             ps = patch_state.get(dst['id'], None)
             if ps is not None:
                 dst.update(ps)
                 if 'desired' in ps:
-                    if 'other' in ps:
-                        dst['state'] = 'overpatched'
+                    if 'others' in ps:
+                        dst['state'] = 'badpatch'
                     elif all(ps['desired'].values()):
                         dst['state'] = 'patched'
-                    elif any(ps['desired'].values()):
+                    elif any([patched for patched in ps['desired'].values() if type(patched) is bool]):
                         dst['state'] = 'partial'
                     else:
                         dst['state'] = 'inactive'
-                elif 'other' in ps:
+                elif 'others' in ps:
                         dst['state'] = 'overpatched'
                 else:
                         dst['state'] = 'unpatched'
+            else:
+                    dst['state'] = 'unpatched'
 
-        return {
-            'srcs': srcs,
-            'dsts': dsts,
-        }, 200 if srcs or dsts else 404
+        meter_url = METER_BASE_URL  + '&'.join([ f'{src}={meterchan}' for src, meterchan in db.get_matrix_meters(id) ])
+
+        info.update({'srcs': srcs, 'dsts': dsts, 'meterurl': meter_url })
+        return info, 200 if srcs or dsts else 404
+
+    @app.route('/matrix/<int:id>/metermap', methods=['GET'])
+    def get_matrix_meter(id):
+        return db.get_matrix_meters(id)
+
+    @app.route('/levels/map', methods=['GET'])
+    def proxy_meter():
+        resp = requests.get('http://127.0.0.1:9081/levels/map',params=flask.request.args)
+        return resp.text
 
     @app.route('/matrix', methods=['POST'])
     def create_matrix_endpoint():
@@ -480,6 +522,14 @@ def api(app, db, pw):
         ok = update_pw_from_db(db, pw)
         return ('"ok"\n', 200) if ok else ('"Failed to unset desired links"', 500)
 
+    @app.route('/sync', methods=['POST'])
+    def sync_now():
+        update_db_from_pw(db, pw)
+        ok = update_pw_from_db(db, pw)
+        time.sleep(0.1)
+        update_db_from_pw(db, pw)
+        return ('"ok"\n', 200) if ok else ({'error':'Sync to PW failed', 'ok':ok}, 500)
+
     @app.route('/links/desired', methods=['GET'])
     def get_port_patches():
         return db.get_port_patches()
@@ -542,7 +592,6 @@ def api(app, db, pw):
         response = err_resp(err)
         logging.exception(f'Unhandled Exception: {response}')
         return flask.jsonify(response), 500
-
 
 
 def test_populate(db, pw):
