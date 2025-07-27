@@ -344,7 +344,8 @@ def update_pw_from_db(db, pw):
     return pw.set_desired(desired)
 
 def api(app, db, pw):
-    METER_BASE_URL = '/levels/map?'
+    METER_HOST = 'http://coralpink:9081'
+    METER_METHOD = '/levels/map'
 
     @app.route('/matrix', methods=['GET'])
     def get_matrices():
@@ -376,7 +377,7 @@ def api(app, db, pw):
             else:
                     dst['state'] = 'unpatched'
 
-        meter_url = METER_BASE_URL  + '&'.join([ f'{src}={meterchan}' for src, meterchan in db.get_matrix_meters(id) ])
+        meter_url = METER_HOST + METER_METHOD + '?' + '&'.join([ f'{src}={meterchan}' for src, meterchan in db.get_matrix_meters(id) ])
 
         info.update({'srcs': srcs, 'dsts': dsts, 'meterurl': meter_url })
         return info, 200 if srcs or dsts else 404
@@ -387,7 +388,7 @@ def api(app, db, pw):
 
     @app.route('/levels/map', methods=['GET'])
     def proxy_meter():
-        resp = requests.get('http://127.0.0.1:9081/levels/map',params=flask.request.args)
+        resp = requests.get(METER_HOST + METER_METHOD, params=flask.request.args)
         return resp.text
 
     @app.route('/matrix', methods=['POST'])
