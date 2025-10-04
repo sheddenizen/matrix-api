@@ -8,6 +8,10 @@ import flask
 from flask_cors import CORS
 import requests
 import json
+import threading
+import queue
+import atexit
+import signal
 
 
 class Db:
@@ -47,6 +51,7 @@ class Db:
             c.execute("CREATE TABLE IF NOT EXISTS link(srcport INTEGER REFERENCES srcport(srcport), dstport INTEGER REFERENCES dstport(dstport), UNIQUE (srcport, dstport) )")
 
             c.execute("CREATE TABLE IF NOT EXISTS meter(meter INTEGER PRIMARY KEY, src INTEGER UNIQUE REFERENCES src(src) ON DELETE CASCADE, lastused REAL)")
+            c.execute("CREATE TABLE IF NOT EXISTS patchhook(client TEXT, src INTEGER NULL REFERENCES src(src) ON DELETE CASCADE, dst INTEGER NULL REFERENCES dst(dst) ON DELETE CASCADE, url TEXT, UNIQUE(src, dst, client) )")
     
     def get_matrix_lines(self, id: int):
         with self.connect() as c:
@@ -85,7 +90,7 @@ class Db:
     def get_matrix_patch_state(self, id: int):
         result = {}
         mtx_desired = self.get_matrix_desired(id)
-        logging.debug(f"Desired: {mtx_desired}")
+        # logging.debug(f"Desired: {mtx_desired}")
         for src, dst, role in mtx_desired:
             if dst not in result:
                 result[dst] = {'desired': { 'src': src }}
@@ -93,7 +98,7 @@ class Db:
             result[dst]['desired'][self.ROLES[role]] = False
 
         mtx_active = self.get_matrix_active(id)
-        logging.debug(f"Active: {mtx_active}")
+        # logging.debug(f"Active: {mtx_active}")
         for src, dst, srcrole, dstrole in mtx_active:
             desired = result.get(dst, {}).get('desired',{'src':None})
             if desired['src'] == src and self.ROLES[dstrole] in desired and dstrole == srcrole:
@@ -110,7 +115,7 @@ class Db:
             else:
                 result[dst]['others'].append({'src':src, self.ROLES[dstrole]: self.ROLES[srcrole]})
 
-        logging.debug(f"Patch state: {result}")
+        # logging.debug(f"Patch state: {result}")
         return result
 
     def get_matrix_meters(self, id: int):
@@ -284,7 +289,40 @@ class Db:
 
     def unpatch(self, dst: int):
         with self.connect() as c:
+            r = c.execute("SELECT src FROM patch where dst == ?", (dst,))
+            current = [ src[0] for src in r.fetchall() ]
             c.execute("DELETE FROM patch WHERE dst == ?", (dst,))
+
+            return current
+
+    def get_hooks(self, client: str|None):
+        with self.connect() as c:
+            if client:
+                r = c.execute("SELECT * FROM patchhook WHERE client = ?", (client,))
+            else:
+                r = c.execute("SELECT * FROM patchhook")
+            res = r.fetchall()
+            logging.debug(f'Searching hooks for {client}, got {res}')
+            return [ dict([('client', cl), ('url', url)] + ([] if src is None else [('src', src)]) + ([] if dst is None else [('dst', dst)])) for cl, src, dst, url in res ]
+
+    def find_hooks(self, src: int, dst: int):
+        with self.connect() as c:
+            r = c.execute("SELECT DISTINCT client, url FROM patchhook WHERE src = ? OR dst = ?", (src, dst))
+
+            return [ {'client': cl, 'url': url } for cl, url in r.fetchall() ]
+
+    def register_hook(self, client: str, src: int|None, dst: int|None, url: str):
+        with self.connect() as c:
+            c.execute("INSERT OR REPLACE INTO patchhook (client, src, dst, url) VALUES ( ?,?,?,? )", (client, src, dst, url))
+
+    def unregister_hook(self, client: str, src: int|None, dst: int|None):
+        with self.connect() as c:
+            if src is not None:
+                c.execute("DELETE FROM patchhook WHERE client == ?, src == ?", (client, src))
+            elif dst is not None:
+                c.execute("DELETE FROM patchhook WHERE client == ?, dst == ?", (client, dst))
+            else:
+                c.execute("DELETE FROM patchhook WHERE client == ?", (client,))
 
     def get_patches(self):
         with self.connect() as c:
@@ -333,6 +371,52 @@ class PW:
             logging.exception(f"Exception {e} getting active links from pipewire")
             raise e
 
+class BackGround(threading.Thread):
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.q = queue.Queue(20)
+
+    def run(self):
+        logging.debug(f'Start background processing thread {threading.current_thread()}')
+        while True:
+            try:
+                item = self.q.get()
+                res = item()
+                logging.debug(f'Background queue item, {item} returned {res}')
+
+            except queue.ShutDown:
+                break
+            except Exception as e:
+                logging.exception(f'Got exception {e} proceessing background task')
+
+        logging.debug(f'Background processing thread {threading.current_thread()} shut down')
+
+    def __exec_patch_hooks(self, patch_not_unpatch: bool, src: int, dst: int):
+        hooks = self.db.find_hooks(src, dst)
+        payload = {'action': ('patch' if patch_not_unpatch else 'unpatch'), 'src': src, 'dst': dst }
+        logging.debug(f'Found {len(hooks)} hooks for {'patch' if patch_not_unpatch else 'unpatch'} operation of src {src}, dst {dst}')
+        for hook in hooks:
+            logging.debug(f"Executing hook for {hook['client']}: {hook['url']}, payload: {payload}")
+            resp = requests.post(hook['url'],json=payload)
+            logging.debug(f"Hook {hook['url']} returned {resp.status_code}: {resp.text}")
+
+    def notify_patch(self, src, dst):
+#        self.q.put(lambda: self.__exec_patch_hooks(True, src, dst), block=False)
+        self.__exec_patch_hooks(True, src, dst)
+
+    def notify_unpatch(self, src, dst):
+#        self.q.put(lambda: self.__exec_patch_hooks(False, src, dst), block=False)
+        self.__exec_patch_hooks(False, src, dst)
+
+    def stop(self):
+        logging.debug(f'Shutting down background processing thread {self}')
+        self.q.shutdown()
+        # self.q.put(lambda: None)
+        self.join(5)
+        if self.is_alive():
+            logging.error(f'Timeout waiting for background thread to terminate')
+
 
 def update_db_from_pw(db, pw):
     srcs, dsts = pw.get_ports()
@@ -343,7 +427,7 @@ def update_pw_from_db(db, pw):
     desired = db.get_port_patches()
     return pw.set_desired(desired)
 
-def api(app, db, pw):
+def api(app, db, pw, bg):
     METER_HOST = 'http://coralpink:9081'
     METER_METHOD = '/levels/map'
 
@@ -515,12 +599,16 @@ def api(app, db, pw):
     def create_patch(dst, src):
         db.patch(src, dst)
         ok = update_pw_from_db(db, pw)
+        bg.notify_patch(src, dst)
         return ('"ok"\n', 200) if ok else ('"Failed to set desired links"', 500)
 
     @app.route('/patch/<int:dst>', methods=['DELETE'])
     def del_patch(dst):
-        db.unpatch(dst)
+        was = db.unpatch(dst)
         ok = update_pw_from_db(db, pw)
+        for src in was:
+            bg.notify_unpatch(src, dst)
+
         return ('"ok"\n', 200) if ok else ('"Failed to unset desired links"', 500)
 
     @app.route('/sync', methods=['POST'])
@@ -538,6 +626,42 @@ def api(app, db, pw):
     @app.route('/links/active', methods=['GET'])
     def get_active_links():
         return pw.get_links()
+
+    @app.route('/hook', methods=['GET'])
+    def get_hooks_all():
+        return db.get_hooks(None)
+
+    @app.route('/hook/<string:client>', methods=['GET'])
+    def get_hooks_by_client(client):
+        logging.info(f'ghbc: {client}')
+        return db.get_hooks(client)
+
+    @app.route('/hook/<string:client>/src/<int:src>', methods=['PUT'])
+    def register_src_hook(client, src):
+        data = flask.request.get_json()
+        db.register_hook(client, src, None, data['url'])
+        return ('"ok"\n', 200) 
+
+    @app.route('/hook/<string:client>/src/<int:src>', methods=['DELETE'])
+    def unregister_src_hook(client, src):
+        db.unregister_hook(client, src, None)
+        return ('"ok"\n', 200) 
+
+    @app.route('/hook/<string:client>/dst/<int:dst>', methods=['PUT'])
+    def register_dst_hook(client, dst):
+        data = flask.request.get_json()
+        db.register_hook(client, None, dst, data['url'])
+        return ('"ok"\n', 200) 
+
+    @app.route('/hook/<string:client>/dst/<int:dst>', methods=['DELETE'])
+    def unregister_dst_hook(client, dst):
+        db.unregister_hook(client, None, dst)
+        return ('"ok"\n', 200) 
+
+    @app.route('/hook/<string:client>', methods=['DELETE'])
+    def unregister_hooks(client):
+        db.unregister_hook(client, None, None)
+        return ('"ok"\n', 200) 
 
     def err_resp(e):
         return {
@@ -615,21 +739,28 @@ def test_populate(db, pw):
         r=c.execute("SELECT matrix FROM matrix WHERE name == 'testmatrix1'")
         return r.fetchone()[0]
     
-
-
-if __name__ == '__main__':
+def make_application():
     logging.basicConfig(level=logging.DEBUG)
     logging.debug(f"Let's Goooo")
     db = Db()
     app = flask.Flask(__name__)
     CORS(app)
     pw = PW()
-    api(app, db, pw)
+    bg = BackGround(db)
+    atexit.register(bg.stop)
+    bg.start()
+    api(app, db, pw, bg)
 
     # mtx = test_populate(db, pw)
     # print(db.get_matrix_lines(mtx))
     update_db_from_pw(db, pw)
     update_pw_from_db(db, pw)
     print(db.get_port_patches())
+    return app
 
+if __name__ == '__main__':
+    app = make_application()
     app.run(host='0.0.0.0', debug=True)
+else:
+    application = make_application()
+
